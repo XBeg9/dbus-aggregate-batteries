@@ -21,6 +21,15 @@ class Functions:
         except Exception:
             return None
 
+    # Max. charge voltage of the aggregate: the highest of all batteries if KEEP_MAX_CVL is set and no battery is
+    # limiting for Cell OVP, else the lowest. An unknown charge mode (None while a driver starts, or a battery without
+    # /Info/ChargeMode) could hide a Cell OVP, so it counts as one.
+
+    def _max_charge_voltage(self, charge_voltages, charge_modes, keep_max_cvl):
+        if keep_max_cvl and all(isinstance(mode, str) and "Cell OVP" not in mode for mode in charge_modes):
+            return self._max(charge_voltages)
+        return self._min(charge_voltages)
+
     # Interpolate f(x) if given lists Y = f(X)
 
     def _interpolate(self, X, Y, x):
