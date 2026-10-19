@@ -1139,11 +1139,8 @@ class DbusAggBatService(object):
         BmsCable_alarm = self._fn._max(BmsCable_alarm_list)
 
         if not settings.OWN_CHARGE_PARAMETERS:
-            
-            if settings.KEEP_MAX_CVL and not any("Cell OVP" in item for item in ChargeMode_list):
-                MaxChargeVoltage = self._fn._max(MaxChargeVoltage_list)
-            else:
-                MaxChargeVoltage = self._fn._min(MaxChargeVoltage_list)
+
+            MaxChargeVoltage = self._fn._max_charge_voltage(MaxChargeVoltage_list, ChargeMode_list, settings.KEEP_MAX_CVL)
 
             if settings.CAN_batteries:
                 MaxChargeCurrent = sum(MaxChargeCurrent_list)
