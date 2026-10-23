@@ -22,11 +22,12 @@ class Functions:
             return None
 
     # Max. charge voltage of the aggregate: the highest of all batteries if KEEP_MAX_CVL is set and no battery is
-    # limiting for Cell OVP, else the lowest. An unknown charge mode (None while a driver starts, or a battery without
-    # /Info/ChargeMode) could hide a Cell OVP, so it counts as one.
+    # limiting for Cell OVP or in (transition to) float, else the lowest. An unknown charge mode (None while a driver
+    # starts, or a battery without /Info/ChargeMode) could hide a Cell OVP, so it counts as one. A pack in float has
+    # finished: taking the other pack's absorption voltage would charge it back up, and the CVL swung between the two.
 
     def _max_charge_voltage(self, charge_voltages, charge_modes, keep_max_cvl):
-        if keep_max_cvl and all(isinstance(mode, str) and "Cell OVP" not in mode for mode in charge_modes):
+        if keep_max_cvl and all(isinstance(mode, str) and "Cell OVP" not in mode and not mode.startswith("Float") for mode in charge_modes):
             return self._max(charge_voltages)
         return self._min(charge_voltages)
 
