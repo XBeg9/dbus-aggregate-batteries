@@ -61,6 +61,11 @@ class Emergency:
         self._cvl: Optional[float] = None
         self._saved_soc = None if stored.last_soc is None else round(stored.last_soc)
 
+    @property
+    def cvl(self) -> float:
+        """The charge voltage emergency mode publishes: the pinned entry voltage, or the cap before one is known."""
+        return self._cvl if self._cvl is not None else self.cfg.cvl_cap_v
+
     def _persist(self):
         self.stored.latched = self._latched
         try:
@@ -162,4 +167,4 @@ class Emergency:
             reason = "start-up without packs"
         else:
             reason = "pack data lost"
-        return Limits(0.0, self._cvl if self._cvl is not None else c.cvl_cap_v, dcl, 0, 1 if dcl > 0 else 0, soc, reason)
+        return Limits(0.0, self.cvl, dcl, 0, 1 if dcl > 0 else 0, soc, reason)

@@ -94,7 +94,8 @@ def world(monkeypatch, tmp_path):
 
     class FakeService:
         def __init__(self, *a, **k):
-            self.d = {}
+            self.d = self._dbusobjects = {}
+            self.fail = None  # a path whose write raises
 
         def add_path(self, path, value, *a, **k):
             self.d[path] = value
@@ -109,7 +110,10 @@ def world(monkeypatch, tmp_path):
             return self.d[path]
 
         def __setitem__(self, path, value):
-            assert path in self.d, path  # the real service has no such path either
+            if path not in self.d:
+                raise KeyError(path)  # like the real service
+            if path == self.fail:
+                raise RuntimeError("publish failed")
             self.d[path] = value
 
         def __enter__(self):
@@ -119,9 +123,9 @@ def world(monkeypatch, tmp_path):
             return False
 
         def del_tree(self, root):
-            for p in self.d:
+            for p in list(self.d):
                 if p.startswith(root + "/"):
-                    self.d[p] = None
+                    del self.d[p]  # like velib: ServiceContext.del_tree -> __del__ -> _item_deleted drops the path
 
     class FakeImport:
         def __init__(self, bus, service, path, eventCallback=None, createsignal=True):
@@ -217,10 +221,17 @@ def test_no_sys_exit_after_register():
     assert [f for f in found if f[0] not in allowed] == []
 
 
-def test_registers_with_zero_charge_current(world):
-    svc = world.make()
-    assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
-    assert svc._dbusservice["/EmergencyMode"] == 0
+def test_registers_with_emergency_safe_limits(world):
+    b = world.make()._dbusservice  # before any tick
+    assert (b["/Info/MaxChargeCurrent"], b["/Info/MaxChargeVoltage"], b["/Info/MaxDischargeCurrent"]) == (0, 53.6, 140)
+    assert (b["/Io/AllowToCharge"], b["/Io/AllowToDischarge"], b["/EmergencyMode"]) == (0, 1, 0)
+
+
+def test_registers_without_discharge_when_emergency_mode_is_off(world):
+    sys.modules["settings"].EMERGENCY_MODE = False
+    b = world.make()._dbusservice
+    assert (b["/Info/MaxChargeCurrent"], b["/Info/MaxChargeVoltage"], b["/Info/MaxDischargeCurrent"]) == (0, 53.6, 0)
+    assert b["/Io/AllowToDischarge"] == 0
 
 
 def test_update_enters_emergency_and_publishes_table(world):
@@ -247,7 +258,7 @@ def test_update_enters_emergency_and_publishes_table(world):
     assert b["/Alarms/BmsCable"] == 2
     assert all(b[p] == 0 for p in b.d if p.startswith("/Alarms/") and p != "/Alarms/BmsCable")
     for p in ("/System/MinCellVoltage", "/System/MaxCellVoltage", "/System/MinVoltageCellId", "/Voltages/Sum", "/Voltages/Diff"):
-        assert b[p] is None, p
+        assert p in b and b[p] is None, p  # still on the bus, unknown
     for p in ("/ConsumedAmphours", "/TimeToGo", "/Dc/0/Temperature", "/System/MinCellTemperature"):
         assert b[p] is None, p
     assert (b["/System/NrOfModulesOnline"], b["/System/NrOfModulesOffline"]) == (0, 2)
@@ -288,12 +299,41 @@ def test_exception_in_emergency_tick_returns_true(world):
     assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
     assert svc._dbusservice["/Info/MaxChargeVoltage"] == 53.0
     assert svc._dbusservice["/Dc/0/Voltage"] == 53.2  # the Multi RS alone
-    svc._dbusservice["/Info/MaxChargeCurrent"] = 99  # proves the except path writes it
+    svc._dbusservice["/Info/MaxChargeCurrent"] = 99  # proves the except path writes them
     svc._dbusservice["/Io/AllowToCharge"] = 1
+    svc._dbusservice["/Info/MaxChargeVoltage"] = 99
     world.bus[PACKS[0]]["/Connected"] = RuntimeError("bug")  # the pack monitor raises: the whole tick fails
     assert svc._update() is True
     assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
     assert svc._dbusservice["/Io/AllowToCharge"] == 0
+    assert svc._dbusservice["/Info/MaxChargeVoltage"] == 53.0  # the episode's pinned entry voltage
+
+
+def test_persistent_publish_exception_enters_emergency(world):
+    svc = started(world)
+    tick(world, svc)
+    svc._dbusservice.fail = "/System/NrOfCellsPerBattery"  # only the normal publish writes it
+    tick(world, svc, 10)
+    assert svc._dbusservice["/EmergencyMode"] == 0
+    tick(world, svc)
+    assert svc._dbusservice["/EmergencyMode"] == 1
+    assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
+
+
+def test_normal_values_return_after_emergency(world, caplog):
+    svc = started(world)
+    tick(world, svc)
+    for p in PACKS:
+        world.bus[p]["/Connected"] = 0
+    tick(world, svc, 11)
+    assert svc._emergency.active
+    for p in PACKS:
+        world.bus[p]["/Connected"] = 1
+    caplog.clear()
+    tick(world, svc, 200)
+    b = svc._dbusservice
+    assert (b["/EmergencyMode"], b["/Info/MaxChargeCurrent"], b["/Io/AllowToCharge"], b["/Voltages/Sum"]) == (0, 140, 1, 53.0)
+    assert "Update failed" not in caplog.text
 
 
 def test_rediscovery_after_driver_restart(world):

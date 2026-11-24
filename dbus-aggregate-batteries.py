@@ -121,6 +121,7 @@ class DbusAggBatService(object):
         )
         self._batteries_ok = False  # the last pack search found all packs
         self._update_running = False
+        self._stepped = False
         self._listed_at = None
         self._ve_paths = {}  # inverter/ESS service -> paths read in emergency mode
         self._dbusConn = get_bus()
@@ -306,18 +307,18 @@ class DbusAggBatService(object):
         )
         self._dbusservice.add_path(
             "/Info/MaxDischargeCurrent",
-            None,
+            self._emergency.cfg.dcl_a,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.1f}A".format(x),
         )
         self._dbusservice.add_path(
             "/Info/MaxChargeVoltage",
-            None,
+            self._emergency.cfg.cvl_cap_v,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.2f}V".format(x),
         )
-        self._dbusservice.add_path("/Io/AllowToCharge", None, writeable=True)
-        self._dbusservice.add_path("/Io/AllowToDischarge", None, writeable=True)
+        self._dbusservice.add_path("/Io/AllowToCharge", 0, writeable=True)
+        self._dbusservice.add_path("/Io/AllowToDischarge", 1 if self._emergency.cfg.dcl_a else 0, writeable=True)
         self._dbusservice.add_path("/Io/AllowToBalance", None, writeable=True)
 
         x = Thread(target=self._startMonitor)
@@ -830,6 +831,7 @@ class DbusAggBatService(object):
 
     def _update(self):
         """GLib timer: must never raise or return False, so the aggregate keeps updating (spec 2026-11-24)."""
+        self._stepped = False  # the state machine steps once per tick
         try:
             self._relist()
             if not self._packs_ok():
@@ -842,12 +844,14 @@ class DbusAggBatService(object):
                 try:
                     self._dbusservice["/Info/MaxChargeCurrent"] = 0
                     self._dbusservice["/Io/AllowToCharge"] = 0
+                    self._dbusservice["/Info/MaxChargeVoltage"] = self._emergency.cvl
                 except Exception:
                     logging.exception("Could not write the emergency charge limits")
-            try:
-                self._emergency_tick(False)
-            except Exception:
-                logging.exception("Emergency tick failed")
+            if not self._stepped:
+                try:
+                    self._emergency_tick(False)
+                except Exception:
+                    logging.exception("Emergency tick failed")
             return True
 
     def _relist(self):
@@ -913,6 +917,7 @@ class DbusAggBatService(object):
         if self._emergency.active or not packs_ok:  # the inverter readings matter only here
             voltages, current = self._read_inverters()
             min_socs = self._read_min_socs()
+        self._stepped = True
         limits = self._emergency.step(self._now(), packs_ok, voltages, current, min_socs, real_soc)
         if limits is None:
             return not packs_ok
@@ -949,7 +954,8 @@ class DbusAggBatService(object):
                 "/System/NrOfModulesBlockingDischarge",
             ):
                 bus[path] = None
-            bus.del_tree("/Voltages")  # sum, diff and the cell paths
+            for path in [p for p in self._dbusservice._dbusobjects if p.startswith("/Voltages/")]:  # sum, diff, cells
+                bus[path] = None  # never del_tree: that removes the paths, and the normal publish needs them back
             bus["/System/NrOfModulesOnline"] = online
             bus["/System/NrOfModulesOffline"] = settings.NR_OF_BATTERIES - online
             for alarm in ("LowVoltage", "HighVoltage", "LowCellVoltage", "HighCellVoltage", "LowSoc", "HighChargeCurrent", "HighDischargeCurrent"):
@@ -1584,7 +1590,7 @@ class DbusAggBatService(object):
                 TimeToGo = TimeToGo / InstalledCapacity
 
         # emergency mode (until 30 s of good data) publishes its own table instead
-        if self._emergency_tick(True, Soc):
+        if self._emergency.active and self._emergency_tick(True, Soc):
             return True
 
         #######################
@@ -1592,8 +1598,6 @@ class DbusAggBatService(object):
         #######################
 
         with self._dbusservice as bus:
-            bus["/EmergencyMode"] = 0
-            bus["/EmergencyReason"] = ""
 
             # send DC
             bus["/Dc/0/Voltage"] = Voltage
@@ -1675,6 +1679,12 @@ class DbusAggBatService(object):
             bus["/Io/AllowToCharge"] = AllowToCharge
             bus["/Io/AllowToDischarge"] = AllowToDischarge
             bus["/Io/AllowToBalance"] = AllowToBalance
+            bus["/EmergencyMode"] = 0  # after the limits
+            bus["/EmergencyReason"] = ""
+
+        # a good tick counts only once its publish went through: a raising publish is bad data (stepped in _update)
+        if not self._stepped:
+            self._emergency_tick(True, Soc)
 
         # ##########################################################
         # ################ Periodic logging ########################
