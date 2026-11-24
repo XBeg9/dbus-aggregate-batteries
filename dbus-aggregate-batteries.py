@@ -123,6 +123,9 @@ class DbusAggBatService(object):
         self._update_running = False
         self._stepped = False
         self._listed_at = None
+        self._searched_packs = None  # the pack services at the last search from _relist
+        self._searched_at = 0.0
+        self._read_failures = 0  # normal-path read failures in a row: the locals dump goes to the log once per run
         self._ve_paths = {}  # inverter/ESS service -> paths read in emergency mode
         self._dbusConn = get_bus()
         logging.info("Initializing VeDbusService...")
@@ -307,7 +310,7 @@ class DbusAggBatService(object):
         )
         self._dbusservice.add_path(
             "/Info/MaxDischargeCurrent",
-            self._emergency.cfg.dcl_a,  # emergency-safe until the first publish
+            0 if self._emergency.latched else self._emergency.cfg.dcl_a,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.1f}A".format(x),
         )
@@ -318,7 +321,7 @@ class DbusAggBatService(object):
             gettextcallback=lambda a, x: "{:.2f}V".format(x),
         )
         self._dbusservice.add_path("/Io/AllowToCharge", 0, writeable=True)
-        self._dbusservice.add_path("/Io/AllowToDischarge", 1 if self._emergency.cfg.dcl_a else 0, writeable=True)
+        self._dbusservice.add_path("/Io/AllowToDischarge", 1 if self._emergency.cfg.dcl_a and not self._emergency.latched else 0, writeable=True)
         self._dbusservice.add_path("/Io/AllowToBalance", None, writeable=True)
 
         x = Thread(target=self._startMonitor)
@@ -855,17 +858,22 @@ class DbusAggBatService(object):
             return True
 
     def _relist(self):
-        """Every 10 s: search the packs again while one is unknown (or gone in emergency mode), list the inverter and ESS services."""
+        """Every 10 s, from the dbus monitor's service list (no D-Bus call): search the packs again while one is unknown
+        (or gone in emergency mode), list the inverter and ESS services."""
         now = self._now()
         if self._listed_at is not None and now - self._listed_at < 10:
             return
         self._listed_at = now
-        names = sorted(str(name) for name in self._dbusConn.list_names())
+        mon = self._dbusMon.dbusmon
+        names = set(mon.get_service_list())
+        packs = set(mon.get_service_list(settings.BATTERY_SERVICE_NAME)) | set(mon.get_service_list(settings.DCLOAD_SERVICE_NAME))
         # a pack gone in normal mode may come back under its name within the grace: a failed search here would forget it
-        gone = not set(self._batteries_dict.values()) <= set(names)
-        if not self._batteries_ok or (gone and self._emergency.active):
+        gone = not set(self._batteries_dict.values()) <= packs
+        # the search logs ~25 lines: again only when the pack services changed, or after 5 min (values that came late)
+        if (not self._batteries_ok or (gone and self._emergency.active)) and (packs != self._searched_packs or now - self._searched_at >= 300):
+            self._searched_packs, self._searched_at = packs, now
             self._find_batteries()
-        multis = [n for n in names if n.startswith("com.victronenergy.multi.")][:1]
+        multis = sorted(n for n in names if n.startswith("com.victronenergy.multi."))[:1]
         paths = {_VEBUS: ["/Dc/0/Voltage", "/Dc/0/Current"]}
         paths.update({n: ["/Dc/0/Voltage", "/Dc/0/Current", "/Settings/Ess/MinimumSocLimit"] for n in multis})
         paths.update({n: ["/Dc/0/Current"] for n in names if n.startswith("com.victronenergy.solarcharger.")})
@@ -873,15 +881,16 @@ class DbusAggBatService(object):
         self._ve_paths = {n: p for n, p in paths.items() if n in names}
 
     def _read(self, service, path):
-        # a fresh import reads the live value: a kept one goes stale when its service restarts
+        # the dbus monitor's cache (dbusmon.py lists the paths): no blocking D-Bus call on the GLib loop
         try:
-            return VeDbusItemImport(self._dbusConn, service, path, createsignal=False).get_value()
-        except Exception:  # gone since the last listing, or unreadable: missing, never 0
+            return self._dbusMon.dbusmon.get_value(service, path)
+        except Exception:  # unreadable: missing, never 0
             return None
 
     def _read_inverters(self):
         """Bank voltages of the MultiPlus and the Multi RS, and the summed battery current (+ = charging) of all inverters
-        and MPPTs. A service whose /Connected is not 1 contributes None."""
+        and MPPTs. A service whose /Connected is not 1 gives no voltage and no current; the sum is None unless every
+        connected one's current is known (a missing one would overstate the discharge and loosen the floor)."""
         voltages, currents = [], []
         for service, paths in self._ve_paths.items():
             if "/Dc/0/Current" not in paths:
@@ -889,9 +898,9 @@ class DbusAggBatService(object):
             connected = self._read(service, "/Connected") == 1
             if "/Dc/0/Voltage" in paths:
                 voltages.append(self._read(service, "/Dc/0/Voltage") if connected else None)
-            currents.append(self._read(service, "/Dc/0/Current") if connected else None)
-        known = [c for c in currents if c is not None]
-        return voltages, (sum(known) if known else None)
+            if connected:
+                currents.append(self._read(service, "/Dc/0/Current"))
+        return voltages, (sum(currents) if currents and None not in currents else None)
 
     def _read_min_socs(self):
         """The ESS minimum SoCs of the MultiPlus (system setting) and the Multi RS."""
@@ -1263,11 +1272,19 @@ class DbusAggBatService(object):
             file = exception_traceback.tb_frame.f_code.co_filename
             line = exception_traceback.tb_lineno
             locals_at_error = exception_traceback.tb_frame.f_locals
-            logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-            logging.error(f"Local variables at error: {locals_at_error}")
-            logging.error("Occured during step %s, Battery %s." % (step, i))
+            self._read_failures += 1
+            if self._read_failures == 1:  # the dump once per run of failures: the log keeps ~100 KB
+                logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
+                logging.error(f"Local variables at error: {locals_at_error}")
+                logging.error("Occured during step %s, Battery %s." % (step, i))
+            else:
+                logging.debug("Read failed again (%d in a row): %r during step %s", self._read_failures, exception_object, step)
             self._emergency_tick(False)  # a read failure is bad pack data (was READ_TRIALS, then exit)
             return True
+
+        if self._read_failures:
+            logging.info("Pack reads work again after %d failed ticks", self._read_failures)
+            self._read_failures = 0
 
         #####################################################
         # Process collected values (except of dictionaries) #

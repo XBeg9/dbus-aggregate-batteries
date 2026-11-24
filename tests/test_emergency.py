@@ -194,3 +194,28 @@ def test_start_in_emergency_when_active_keeps_cvl():
     assert tick(e, 10, False, v=(52.9,)).cvl == 52.9
     e.start_in_emergency(11)
     assert tick(e, 11, False, v=(54.0,)).cvl == 52.9
+
+
+def test_bad_real_soc_is_ignored():
+    w = Rec()
+    e = make(write=w)
+    assert tick(e, 0, True, soc=80.0) is None
+    for t, bad in enumerate((float("nan"), float("inf"), 150.0, -5.0), 1):
+        assert tick(e, t, True, soc=bad) is None
+        assert e.stored.last_soc == 80.0
+    assert all(json.loads(c)["last_soc"] == 80.0 for c in w.calls)
+
+
+def test_bad_stored_soc_loads_as_none(tmp_path):
+    p = tmp_path / "st"
+    for bad in ("NaN", "Infinity", "150", "-5", '"abc"'):
+        p.write_text('{"latched": true, "last_soc": %s}' % bad)
+        assert load_state(str(p)) == Stored(latched=True, last_soc=None), bad
+    p.write_text('{"latched": "false", "last_soc": 40}')
+    assert load_state(str(p)) == Stored(latched=False, last_soc=40.0)
+
+
+def test_constructs_from_bad_stored_soc():
+    for bad in (float("nan"), float("inf"), 150.0, -5.0):
+        e = make(Stored(latched=True, last_soc=bad))
+        assert e.latched and e.stored.last_soc is None

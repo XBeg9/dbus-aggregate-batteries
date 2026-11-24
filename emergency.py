@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from dataclasses import asdict, dataclass
 from typing import Callable, Optional, Sequence
 
@@ -37,12 +38,17 @@ class Limits:
     reason: str
 
 
+def _soc_ok(soc) -> bool:
+    return isinstance(soc, (int, float)) and math.isfinite(soc) and 0 <= soc <= 100
+
+
 def load_state(path: str) -> Stored:
     try:
         with open(path) as f:
             d = json.load(f)
         soc = d.get("last_soc")
-        return Stored(latched=bool(d.get("latched", False)), last_soc=None if soc is None else float(soc))
+        # each field on its own: a bad SoC must not drop a latch; only a JSON true latches
+        return Stored(latched=d.get("latched") is True, last_soc=float(soc) if _soc_ok(soc) else None)
     except Exception:  # missing, unreadable or corrupt: not latched, no last SoC
         return Stored()
 
@@ -51,6 +57,8 @@ class Emergency:
     def __init__(self, cfg: EmergencyConfig, stored: Stored, write: Callable[[str], None]):
         self.cfg = cfg
         self.stored = stored
+        if not _soc_ok(stored.last_soc):  # NaN or out of range must never reach round() before register()
+            stored.last_soc = None
         self._write = write
         self.active = False
         self._startup = False
@@ -60,6 +68,10 @@ class Emergency:
         self._below_since: Optional[float] = None
         self._cvl: Optional[float] = None
         self._saved_soc = None if stored.last_soc is None else round(stored.last_soc)
+
+    @property
+    def latched(self) -> bool:
+        return self._latched
 
     @property
     def cvl(self) -> float:
@@ -105,7 +117,7 @@ class Emergency:
                 if self._latched and now - self._good_since >= c.exit_s:  # a persisted latch ends with normal mode
                     self._latched = False
                     self._persist()
-                if real_soc is not None:
+                if _soc_ok(real_soc):
                     self.stored.last_soc = real_soc
                     if round(real_soc) != self._saved_soc:
                         self._saved_soc = round(real_soc)

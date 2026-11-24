@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import json
 import shutil
 import sys
 import types
@@ -146,6 +147,9 @@ def world(monkeypatch, tmp_path):
                 raise v
             return v
 
+        def get_service_list(self, classfilter=None):  # like velib: {name: device instance}, by the name's first three parts
+            return {n: 0 for n in w.bus if classfilter is None or ".".join(n.split(".")[:3]) == classfilter}
+
     class FakeThread:
         def __init__(self, target):
             self.target = target
@@ -241,7 +245,7 @@ def test_update_enters_emergency_and_publishes_table(world):
     assert svc._dbusservice["/Info/MaxChargeCurrent"] == 140
     for p in PACKS:
         world.bus[p]["/Connected"] = 0
-    world.bus[MULTI]["/Dc/0/Voltage"] = DBusException("multi gone")  # a vanished inverter counts as missing
+    world.bus[MULTI]["/Dc/0/Voltage"] = None  # a reading the monitor does not have counts as missing
     tick(world, svc, 11)
     b = svc._dbusservice
     assert b["/EmergencyMode"] == 1
@@ -277,7 +281,7 @@ def test_grace_keeps_last_good_values(world):
         assert b["/EmergencyMode"] == 0
 
 
-def test_exception_in_normal_tick_counts_as_bad_data(world):
+def test_exception_in_normal_tick_counts_as_bad_data(world, caplog):
     svc = started(world)
     tick(world, svc)
     world.bus[PACKS[1]]["/Dc/0/Temperature"] = None  # the normal read raises
@@ -286,6 +290,11 @@ def test_exception_in_normal_tick_counts_as_bad_data(world):
     tick(world, svc)
     assert svc._dbusservice["/EmergencyMode"] == 1
     assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
+    assert caplog.text.count("Local variables at error") == 1  # once per run of failures, not every second
+    world.bus[PACKS[1]]["/Dc/0/Temperature"] = 20.0
+    caplog.set_level("INFO")
+    tick(world, svc)
+    assert caplog.text.count("Pack reads work again after 11 failed ticks") == 1
 
 
 def test_exception_in_emergency_tick_returns_true(world):
@@ -383,3 +392,64 @@ def test_pack_back_under_a_new_name(world):
     tick(world, svc)
     assert svc._dbusservice["/EmergencyMode"] == 0
     assert sorted(svc._batteries_dict.values()) == [PACKS[0], "com.victronenergy.battery.ttyUSB2"]
+
+
+def test_no_blocking_imports_in_the_update_path():
+    found = {
+        f.name
+        for f in ast.walk(ast.parse(SRC.read_text()))
+        if isinstance(f, ast.FunctionDef)
+        for c in ast.walk(f)
+        if isinstance(c, ast.Call) and getattr(c.func, "id", None) == "VeDbusItemImport"
+    }
+    assert found == {"_find_settings", "_callback_changed_custom_name"}  # the emergency reads use the dbus monitor's cache
+
+
+def test_persisted_latch_keeps_discharge_shut_from_registration(world, tmp_path):
+    (tmp_path / "storedvalue_emergency").write_text(json.dumps({"latched": True, "last_soc": 40.0}))
+    world.bus.update(inverters())
+    svc = world.make()
+    b = svc._dbusservice  # before any tick: a restart must not reopen the latched stop
+    assert (b["/Info/MaxChargeCurrent"], b["/Info/MaxDischargeCurrent"], b["/Io/AllowToDischarge"]) == (0, 0, 0)
+    while svc._find_batteries():
+        pass
+    for _ in range(5):
+        tick(world, svc)
+        assert (b["/Info/MaxDischargeCurrent"], b["/Io/AllowToDischarge"]) == (0, 0)
+    assert b["/EmergencyReason"] == "floor latched"
+
+
+def test_pack_search_only_when_the_pack_services_change(world):
+    world.bus.update(inverters())
+    svc = world.make()
+    while svc._find_batteries():
+        pass
+    calls = []
+    search = svc._find_batteries
+    svc._find_batteries = lambda: calls.append(world.t) or search()
+    tick(world, svc, 60)
+    assert len(calls) <= 1  # packs absent, names unchanged: not every 10 s (~25 log lines each)
+    n = len(calls)
+    world.bus[PACKS[0]] = pack(1)
+    tick(world, svc, 10)
+    assert len(calls) == n + 1
+
+
+def test_missing_current_means_no_load_correction(world):
+    svc = started(world)
+    tick(world, svc)
+    for p in PACKS:
+        world.bus[p]["/Connected"] = 0
+    world.bus[VEBUS].update({"/Dc/0/Voltage": 50.3, "/Dc/0/Current": -100.0})
+    world.bus[MULTI].update({"/Dc/0/Voltage": 50.3, "/Dc/0/Current": 0.0})
+    tick(world, svc, 45)
+    b = svc._dbusservice
+    assert b["/EmergencyMode"] == 1
+    assert b["/Dc/0/Current"] == -96.0
+    assert b["/Info/MaxDischargeCurrent"] == 140  # 50.3 V + 96 A x 8.2 mOhm is above the 50.4 V floor
+    world.bus["com.victronenergy.solarcharger.ttyS2"]["/Dc/0/Current"] = None  # connected, reading missing
+    tick(world, svc)
+    assert b["/Dc/0/Current"] is None and b["/Dc/0/Power"] is None
+    tick(world, svc, 30)
+    assert b["/Info/MaxDischargeCurrent"] == 0  # no correction: 50.3 V is below the floor
+    assert b["/EmergencyReason"] == "floor latched"
