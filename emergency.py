@@ -75,6 +75,8 @@ class Emergency:
         logging.warning("emergency mode ON (%s), bank %s V", "start-up without packs" if startup else "pack data lost", bank_v)
 
     def start_in_emergency(self, now: float) -> None:
+        if self.active:  # must not re-pin the entry CVL
+            return
         self._enter(True, None)
 
     def step(
@@ -93,12 +95,18 @@ class Emergency:
         if not self.active:
             if packs_ok:
                 self._bad_since = None
+                if self._good_since is None:
+                    self._good_since = now
+                if self._latched and now - self._good_since >= c.exit_s:  # a persisted latch ends with normal mode
+                    self._latched = False
+                    self._persist()
                 if real_soc is not None:
                     self.stored.last_soc = real_soc
                     if round(real_soc) != self._saved_soc:
                         self._saved_soc = round(real_soc)
                         self._persist()
             else:
+                self._good_since = None
                 if self._bad_since is None:
                     self._bad_since = now
                 if now - self._bad_since >= c.enter_s:

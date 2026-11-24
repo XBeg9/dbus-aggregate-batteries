@@ -158,8 +158,39 @@ def test_state_file_roundtrip_and_corrupt(tmp_path):
 
 
 def test_write_failure_is_ignored():
-    def boom(_):
+    calls = []
+
+    def boom(c):
+        calls.append(c)
         raise OSError("disk")
 
     e = make(write=boom)
-    assert enter(e) is not None
+    assert tick(e, 0, True, soc=80.0) is None
+    assert calls and e.stored.last_soc == 80.0
+    enter(e, 1)
+    n = len(calls)
+    for t in range(100, 130):
+        tick(e, t, False, v=(50.2,), i=-10.0)
+    lim = tick(e, 130, False, v=(50.2,), i=-10.0)
+    assert len(calls) > n and lim.dcl == 0
+
+
+def test_persisted_latch_clears_in_normal_mode_after_exit_s():
+    w = Rec()
+    e = make(Stored(latched=True), w)
+    for t in range(0, 30):  # 0..29 s: 29 s elapsed at the last tick
+        assert tick(e, t, True, soc=None) is None
+    assert e._latched and not w.calls
+    assert tick(e, 30, True, soc=None) is None
+    assert not e._latched and json.loads(w.calls[-1])["latched"] is False
+    lim = enter(e, 31)
+    assert lim.dcl == 140 and lim.reason == "pack data lost"
+
+
+def test_start_in_emergency_when_active_keeps_cvl():
+    e = make()
+    for t in range(10):
+        tick(e, t, False, v=(52.9,))
+    assert tick(e, 10, False, v=(52.9,)).cvl == 52.9
+    e.start_in_emergency(11)
+    assert tick(e, 11, False, v=(54.0,)).cvl == 52.9
