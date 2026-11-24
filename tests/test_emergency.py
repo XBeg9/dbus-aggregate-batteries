@@ -12,7 +12,7 @@ class Rec:
 
 
 def make(stored=None, write=None):
-    return Emergency(EmergencyConfig(), stored or Stored(), write or Rec())
+    return Emergency(EmergencyConfig(r_ohm=0.0056), stored or Stored(), write or Rec())
 
 
 def tick(e, t, ok, v=(53.0, 53.1), i=-20.0, mins=(95, 95), soc=83.0):

@@ -13,7 +13,7 @@ class EmergencyConfig:
     exit_s: float = 30
     floor_v: float = 50.4
     floor_s: float = 30
-    r_ohm: float = 0.0056
+    r_ohm: float = 0.0082
     cvl_cap_v: float = 53.6
     dcl_a: float = 140.0
     v_min: float = 40.0
