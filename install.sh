@@ -47,6 +47,12 @@ function backup_config {
         mv /data/dbus-aggregate-batteries/last_balancing /data/dbus-aggregate-batteries_last_balancing.backup
         echo "last_balancing backed up to /data/dbus-aggregate-batteries_last_balancing.backup"
     fi
+
+    # backup storedvalue_emergency (emergency mode latch and last real SoC)
+    if [ -f "/data/apps/dbus-aggregate-batteries/storedvalue_emergency" ]; then
+        mv /data/apps/dbus-aggregate-batteries/storedvalue_emergency /data/apps/dbus-aggregate-batteries_storedvalue_emergency.backup
+        echo "storedvalue_emergency backed up to /data/apps/dbus-aggregate-batteries_storedvalue_emergency.backup"
+    fi
 }
 
 function restore_config {
@@ -134,6 +140,12 @@ function restore_config {
             mv /data/dbus-aggregate-batteries_last_balancing.backup /data/dbus-aggregate-batteries/last_balancing
             echo "last_balancing restored to /data/dbus-aggregate-batteries/last_balancing"
         fi
+    fi
+
+    # restore storedvalue_emergency
+    if [ -f "/data/apps/dbus-aggregate-batteries_storedvalue_emergency.backup" ] && [ -d "/data/apps/dbus-aggregate-batteries" ]; then
+        mv /data/apps/dbus-aggregate-batteries_storedvalue_emergency.backup /data/apps/dbus-aggregate-batteries/storedvalue_emergency
+        echo "storedvalue_emergency restored to /data/apps/dbus-aggregate-batteries/storedvalue_emergency"
     fi
 }
 

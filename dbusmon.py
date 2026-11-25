@@ -125,15 +125,24 @@ class DbusMon:
             },
             "com.victronenergy.vebus": {
                 "/Connected": dummy,
+                "/Dc/0/Voltage": dummy,  # emergency mode
                 "/Dc/0/Current": dummy,
                 "/ProductName": dummy,
             },
+            "com.victronenergy.multi": {  # emergency mode
+                "/Connected": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/Dc/0/Current": dummy,
+                "/Settings/Ess/MinimumSocLimit": dummy,
+            },
             "com.victronenergy.solarcharger": {
+                "/Connected": dummy,  # emergency mode
                 "/Dc/0/Current": dummy,
                 "/ProductName": dummy,
             },
             "com.victronenergy.settings": {
                 "/Settings/CGwacs/OvervoltageFeedIn": dummy,
+                "/Settings/CGwacs/BatteryLife/MinimumSocLimit": dummy,  # emergency mode
             },
             "com.victronenergy.system": {
                 "/SystemState/LowSoc": dummy,

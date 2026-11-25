@@ -249,6 +249,18 @@ UPDATE_INTERVAL_FIND_DEVICES: int = get_int_from_config("DEFAULT", "UPDATE_INTER
 UPDATE_INTERVAL_DATA: int = get_int_from_config("DEFAULT", "UPDATE_INTERVAL_DATA")
 TIME_BEFORE_RESTART: int = get_int_from_config("DEFAULT", "TIME_BEFORE_RESTART")
 
+# ----- Emergency mode -----
+EMERGENCY_MODE: bool = get_bool_from_config("DEFAULT", "EMERGENCY_MODE")
+EMERGENCY_ENTER_S: float = get_float_from_config("DEFAULT", "EMERGENCY_ENTER_S", 10)
+EMERGENCY_EXIT_S: float = get_float_from_config("DEFAULT", "EMERGENCY_EXIT_S", 30)
+EMERGENCY_FLOOR_V: float = get_float_from_config("DEFAULT", "EMERGENCY_FLOOR_V", 50.4)
+EMERGENCY_FLOOR_S: float = get_float_from_config("DEFAULT", "EMERGENCY_FLOOR_S", 30)
+EMERGENCY_R_OHM: float = get_float_from_config("DEFAULT", "EMERGENCY_R_OHM", 0.0082)
+EMERGENCY_CVL_CAP_V: float = get_float_from_config("DEFAULT", "EMERGENCY_CVL_CAP_V", 53.6)
+EMERGENCY_DCL_A: float = get_float_from_config("DEFAULT", "EMERGENCY_DCL_A", 140)
+EMERGENCY_V_MIN: float = get_float_from_config("DEFAULT", "EMERGENCY_V_MIN", 40)
+EMERGENCY_V_MAX: float = get_float_from_config("DEFAULT", "EMERGENCY_V_MAX", 62)
+
 
 # ----- Options -----
 CURRENT_FROM_VICTRON: bool = get_bool_from_config("DEFAULT", "CURRENT_FROM_VICTRON")

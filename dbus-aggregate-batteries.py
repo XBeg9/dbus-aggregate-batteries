@@ -24,6 +24,7 @@ import dbus
 import re
 import settings
 from functions import Functions
+from emergency import Emergency, EmergencyConfig, load_state
 
 # for UTC time stamps for logging
 from datetime import datetime as dt
@@ -45,6 +46,8 @@ VERSION = "4.3.20260923-beta"
 
 _STATE_FILE_CHARGE = "/data/apps/dbus-aggregate-batteries/storedvalue_charge"
 _STATE_FILE_BALANCING = "/data/apps/dbus-aggregate-batteries/storedvalue_last_balancing"
+_STATE_FILE_EMERGENCY = "/data/apps/dbus-aggregate-batteries/storedvalue_emergency"
+_VEBUS = "com.victronenergy.vebus.ttyS4"
 
 
 def _write_atomic(path: str, content: str) -> None:
@@ -87,7 +90,6 @@ class DbusAggBatService(object):
         self._num_battery_shunts = 0
         self._settings = None
         self._searchTrials = 1
-        self._readTrials = 1
         self._MaxChargeVoltage_old = 0
         self._MaxChargeCurrent_old = 0
         self._MaxDischargeCurrent_old = 0
@@ -98,6 +100,36 @@ class DbusAggBatService(object):
         self._multi_connected = True
         # implementing hysteresis for allowing discharge
         self._fullyDischarged = False
+        # emergency mode (spec 2026-11-24): stay on D-Bus with limits from the inverters' bank voltage when pack data is lost
+        self._now = tt.monotonic
+        self._emergency = Emergency(
+            EmergencyConfig(
+                enabled=settings.EMERGENCY_MODE,
+                enter_s=settings.EMERGENCY_ENTER_S,
+                exit_s=settings.EMERGENCY_EXIT_S,
+                floor_v=settings.EMERGENCY_FLOOR_V,
+                floor_s=settings.EMERGENCY_FLOOR_S,
+                r_ohm=settings.EMERGENCY_R_OHM,
+                cvl_cap_v=settings.EMERGENCY_CVL_CAP_V,
+                # EMERGENCY_MODE = False: same flow, but no discharge either (upstream's outcome, without leaving D-Bus)
+                dcl_a=settings.EMERGENCY_DCL_A if settings.EMERGENCY_MODE else 0,
+                v_min=settings.EMERGENCY_V_MIN,
+                v_max=settings.EMERGENCY_V_MAX,
+            ),
+            load_state(_STATE_FILE_EMERGENCY),
+            lambda content: _write_atomic(_STATE_FILE_EMERGENCY, content),
+        )
+        self._batteries_ok = False  # the last pack search found all packs
+        self._update_running = False
+        self._stepped = False
+        self._listed_at = None
+        self._searched_packs = None  # the pack services at the last search from _relist
+        self._searched_at = 0.0
+        self._read_failures = 0  # normal-path read failures in a row: the locals dump goes to the log once per run
+        self._update_failures = 0  # ticks in a row that raised: the traceback goes to the log once per run
+        self._update_error = None  # the exception type of that run: a different one is logged again
+        self._published = False  # this tick's normal publish went through
+        self._ve_paths = {}  # inverter/ESS service -> paths read in emergency mode
         self._dbusConn = get_bus()
         logging.info("Initializing VeDbusService...")
         self._dbusservice = VeDbusService(servicename, self._dbusConn, register=False)
@@ -177,6 +209,8 @@ class DbusAggBatService(object):
         self._dbusservice.add_path("/FirmwareVersion", VERSION)
         self._dbusservice.add_path("/HardwareVersion", VERSION)
         self._dbusservice.add_path("/Connected", 1)
+        self._dbusservice.add_path("/EmergencyMode", 0)
+        self._dbusservice.add_path("/EmergencyReason", "")
 
         # Create DC paths
         self._dbusservice.add_path(
@@ -273,24 +307,24 @@ class DbusAggBatService(object):
         # Create control paths
         self._dbusservice.add_path(
             "/Info/MaxChargeCurrent",
-            None,
+            0,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.1f}A".format(x),
         )
         self._dbusservice.add_path(
             "/Info/MaxDischargeCurrent",
-            None,
+            0 if self._emergency.latched else self._emergency.cfg.dcl_a,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.1f}A".format(x),
         )
         self._dbusservice.add_path(
             "/Info/MaxChargeVoltage",
-            None,
+            self._emergency.cfg.cvl_cap_v,  # emergency-safe until the first publish
             writeable=True,
             gettextcallback=lambda a, x: "{:.2f}V".format(x),
         )
-        self._dbusservice.add_path("/Io/AllowToCharge", None, writeable=True)
-        self._dbusservice.add_path("/Io/AllowToDischarge", None, writeable=True)
+        self._dbusservice.add_path("/Io/AllowToCharge", 0, writeable=True)
+        self._dbusservice.add_path("/Io/AllowToDischarge", 1 if self._emergency.cfg.dcl_a and not self._emergency.latched else 0, writeable=True)
         self._dbusservice.add_path("/Io/AllowToBalance", None, writeable=True)
 
         x = Thread(target=self._startMonitor)
@@ -487,16 +521,14 @@ class DbusAggBatService(object):
                         # Create voltage paths with battery names
                         if settings.SEND_CELL_VOLTAGES == 1:
                             for cellId in range(1, (settings.NR_OF_CELLS_PER_BATTERY) + 1):
-                                self._dbusservice.add_path(
-                                    "/Voltages/%s_Cell%d"
-                                    % (
-                                        re.sub("[^A-Za-z0-9_]+", "", BatteryName),
-                                        cellId,
-                                    ),
-                                    None,
-                                    writeable=True,
-                                    gettextcallback=lambda a, x: "{:.3f}V".format(x),
-                                )
+                                cell_path = "/Voltages/%s_Cell%d" % (re.sub("[^A-Za-z0-9_]+", "", BatteryName), cellId)
+                                if cell_path not in self._dbusservice:  # searched again in emergency mode
+                                    self._dbusservice.add_path(
+                                        cell_path,
+                                        None,
+                                        writeable=True,
+                                        gettextcallback=lambda a, x: "{:.3f}V".format(x),
+                                    )
 
                         # Check if Nr. of cells is equal
                         nr_of_cells = self._dbusMon.dbusmon.get_value(service, "/System/NrOfCellsPerBattery")
@@ -506,16 +538,12 @@ class DbusAggBatService(object):
                                 logging.error("     |- Number of battery cells does not match config:")
                                 logging.error("        |- Cells found in battery:         %d" % nr_of_cells)
                                 logging.error("        |- Cells specified in config file: %d" % settings.NR_OF_CELLS_PER_BATTERY)
-                                logging.error("Exiting...")
-                                tt.sleep(settings.TIME_BEFORE_RESTART)
-                                sys.exit(1)
+                                raise ValueError("number of battery cells does not match config")
                         elif nr_of_cells != settings.NR_OF_CELLS_PER_BATTERY:
                             logging.error("     |- Number of battery cells does not match config:")
-                            logging.error("        |- Cells found in battery:         %d" % nr_of_cells)
+                            logging.error("        |- Cells found in battery:         %s" % nr_of_cells)
                             logging.error("        |- Cells specified in config file: %d" % settings.NR_OF_CELLS_PER_BATTERY)
-                            logging.error("Exiting...")
-                            tt.sleep(settings.TIME_BEFORE_RESTART)
-                            sys.exit(1)
+                            raise ValueError("number of battery cells does not match config")
 
                         # end of section
 
@@ -554,13 +582,11 @@ class DbusAggBatService(object):
                                     # Bail out with an error if list entry is neither string integer nor string
                                     else:
                                         logging.error(
-                                            '   |- Bad element #%d in "%s" in USE_SMARTSHUNTS list. Entries need to be '
-                                            + " VRM instancmbers or Name strings. Exiting...",
+                                            '   |- Bad element #%d in "%s" in USE_SMARTSHUNTS list. Entries need to be VRM instancmbers or Name strings.',
                                             shunt_id + 1,
                                             settings.USE_SMARTSHUNTS[shunt_id],
                                         )
-                                        tt.sleep(settings.TIME_BEFORE_RESTART)
-                                        sys.exit(1)
+                                        raise ValueError("bad USE_SMARTSHUNTS element")
 
                                     # if a shunt has been matched as one the user defined and we haven't included it
                                     # yet, we can get out of this loop
@@ -596,8 +622,8 @@ class DbusAggBatService(object):
             file = exception_traceback.tb_frame.f_code.co_filename
             line = exception_traceback.tb_lineno
             logging.debug(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-
-            pass
+            logging.error(f"Battery search failed: {repr(exception_object)}")
+            batteriesCount = -1  # an interrupted search never counts as complete
 
         # when SmartShunts have been found, add their overall number in addition to
         # the number of batteries aggregated to the log output
@@ -613,18 +639,18 @@ class DbusAggBatService(object):
             logging.info("> %d batteries found." % (batteriesCount))
 
         # make sure the correct number of batteries and SmartShunts has been found
-        if (batteriesCount == settings.NR_OF_BATTERIES) and (len(self._smartShunt_list) >= NR_OF_SMARTSHUNTS):
+        self._batteries_ok = (batteriesCount == settings.NR_OF_BATTERIES) and (len(self._smartShunt_list) >= NR_OF_SMARTSHUNTS)
+        if self._batteries_ok:
             if self._ownCharge < 0:
                 self._ownCharge = Soc / 100.0
                 Soc /= InstalledCapacity
-            if settings.CURRENT_FROM_VICTRON:
+            if settings.CURRENT_FROM_VICTRON and not self._update_running:
                 self._searchTrials = 1
                 # if current from Victron stuff search multi/quattro on DBus
                 GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_FIND_DEVICES, self._find_multis)
             else:
-                self._timeOld = tt.time()
                 # if current from BMS start the _update loop
-                GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+                self._start_update()
 
             # all OK, stop calling this function
             return False
@@ -633,19 +659,22 @@ class DbusAggBatService(object):
             self._searchTrials += 1
             # next trial
             return True
-        # bail out if correct number of batteries and SmartShunts can not be found after SEARCH_TRIALS tries
+        # emergency mode instead of exiting if the batteries can not be found after SEARCH_TRIALS tries; _update searches on
         else:
             if NR_OF_SMARTSHUNTS > 0:
                 logging.error(
-                    "Required nr of batteries (%d) or SmartShunts (%d) not found. Exiting...",
+                    "Required nr of batteries (%d) or SmartShunts (%d) not found.",
                     settings.NR_OF_BATTERIES,
                     NR_OF_SMARTSHUNTS,
                 )
             else:
                 logging.info(self._batteries_dict)
-                logging.error("Required number of batteries not found. Exiting...")
-            tt.sleep(settings.TIME_BEFORE_RESTART)
-            sys.exit(1)
+                logging.error("Required number of batteries not found.")
+            # at start-up only: a search again from _update leaves the entry to the 10 s grace
+            if not self._update_running:
+                self._emergency.start_in_emergency(self._now())
+                self._start_update()
+            return False
 
     # #########################################################################
     # #########################################################################
@@ -684,18 +713,15 @@ class DbusAggBatService(object):
                     # next trial
                     return True
                 else:
-                    logging.error("Multi/Quattro not found. Exiting...")
-                    tt.sleep(settings.TIME_BEFORE_RESTART)
-                    sys.exit(1)
+                    logging.error("Multi/Quattro not found. Continuing without it.")
 
         if settings.NR_OF_MPPTS > 0:
             self._searchTrials = 1
             # search MPPTs on DBus if present
             GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_FIND_DEVICES, self._find_mppts)
         else:
-            self._timeOld = tt.time()
             # if no MPPTs start the _update loop
-            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+            self._start_update()
 
         # all OK, stop calling this function
         return False
@@ -730,8 +756,7 @@ class DbusAggBatService(object):
 
         logging.info("> %d MPPT(s) found." % (mpptsCount))
         if mpptsCount == settings.NR_OF_MPPTS:
-            self._timeOld = tt.time()
-            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+            self._start_update()
             # all OK, stop calling this function
             return False
         elif self._searchTrials < settings.SEARCH_TRIALS:
@@ -739,9 +764,9 @@ class DbusAggBatService(object):
             # next trial
             return True
         else:
-            logging.error("Required number of MPPTs not found. Exiting...")
-            tt.sleep(settings.TIME_BEFORE_RESTART)
-            sys.exit(1)
+            logging.error("Required number of MPPTs not found. Continuing without them.")
+            self._start_update()
+            return False
 
     def _callback_changed_custom_name(self, path, value):
         """
@@ -804,7 +829,169 @@ class DbusAggBatService(object):
     # #################################################################################
     # #################################################################################
 
+    def _start_update(self):
+        if not self._update_running:
+            self._update_running = True
+            self._timeOld = tt.time()
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+
     def _update(self):
+        """GLib timer: must never raise or return False, so the aggregate keeps updating (spec 2026-11-24)."""
+        self._stepped = False  # the state machine steps once per tick
+        self._published = False
+        try:
+            self._relist()
+            if not self._packs_ok():
+                self._emergency_tick(False)
+            else:
+                self._update_normal()
+            # only a normal publish ends a run: emergency or grace ticks in between would log the traceback again every ~40 s
+            if self._update_failures and self._published:
+                logging.info("Update works again after %d failed ticks", self._update_failures)
+                self._update_failures = 0
+                self._update_error = None
+            return True
+        except Exception as ex:
+            self._update_failures += 1
+            if self._update_failures == 1 or type(ex) is not self._update_error:  # once per run and kind: the log keeps ~100 KB
+                self._update_error = type(ex)
+                logging.exception("Update failed, counts as bad pack data")
+            else:
+                logging.debug("Update failed again (%d in a row)", self._update_failures, exc_info=True)
+            if self._emergency.active:
+                try:
+                    self._dbusservice["/Info/MaxChargeCurrent"] = 0
+                    self._dbusservice["/Io/AllowToCharge"] = 0
+                    self._dbusservice["/Info/MaxChargeVoltage"] = self._emergency.cvl
+                except Exception:
+                    logging.exception("Could not write the emergency charge limits")
+            if not self._stepped:
+                try:
+                    self._emergency_tick(False)
+                except Exception:
+                    logging.exception("Emergency tick failed")
+            return True
+
+    def _relist(self):
+        """Every 10 s, from the dbus monitor's service list (no D-Bus call): search the packs again while one is unknown
+        (or gone in emergency mode), list the inverter and ESS services."""
+        now = self._now()
+        if self._listed_at is not None and now - self._listed_at < 10:
+            return
+        self._listed_at = now
+        mon = self._dbusMon.dbusmon
+        names = set(mon.get_service_list())
+        packs = set(mon.get_service_list(settings.BATTERY_SERVICE_NAME)) | set(mon.get_service_list(settings.DCLOAD_SERVICE_NAME))
+        # a pack gone in normal mode may come back under its name within the grace: a failed search here would forget it
+        gone = not set(self._batteries_dict.values()) <= packs
+        # the search logs ~25 lines: again only when the pack services changed, or after 5 min (values that came late)
+        if (not self._batteries_ok or (gone and self._emergency.active)) and (packs != self._searched_packs or now - self._searched_at >= 300):
+            self._searched_packs, self._searched_at = packs, now
+            self._find_batteries()
+        multis = sorted(n for n in names if n.startswith("com.victronenergy.multi."))[:1]
+        paths = {_VEBUS: ["/Dc/0/Voltage", "/Dc/0/Current"]}
+        paths.update({n: ["/Dc/0/Voltage", "/Dc/0/Current", "/Settings/Ess/MinimumSocLimit"] for n in multis})
+        paths.update({n: ["/Dc/0/Current"] for n in names if n.startswith("com.victronenergy.solarcharger.")})
+        paths["com.victronenergy.settings"] = ["/Settings/CGwacs/BatteryLife/MinimumSocLimit"]
+        self._ve_paths = {n: p for n, p in paths.items() if n in names}
+
+    def _read(self, service, path):
+        # the dbus monitor's cache (dbusmon.py lists the paths): no blocking D-Bus call on the GLib loop
+        try:
+            return self._dbusMon.dbusmon.get_value(service, path)
+        except Exception:  # unreadable: missing, never 0
+            return None
+
+    def _read_inverters(self):
+        """Bank voltages of the MultiPlus and the Multi RS, and the summed battery current (+ = charging) of all inverters
+        and MPPTs. A service whose /Connected is not 1 gives no voltage and no current; the sum is None unless every
+        connected one's current is known (a missing one would overstate the discharge and loosen the floor)."""
+        voltages, currents = [], []
+        for service, paths in self._ve_paths.items():
+            if "/Dc/0/Current" not in paths:
+                continue
+            connected = self._read(service, "/Connected") == 1
+            if "/Dc/0/Voltage" in paths:
+                voltages.append(self._read(service, "/Dc/0/Voltage") if connected else None)
+            if connected:
+                currents.append(self._read(service, "/Dc/0/Current"))
+        return voltages, (sum(currents) if currents and None not in currents else None)
+
+    def _read_min_socs(self):
+        """The ESS minimum SoCs of the MultiPlus (system setting) and the Multi RS."""
+        return [self._read(s, p) for s, paths in self._ve_paths.items() for p in paths if p.endswith("/MinimumSocLimit")]
+
+    def _packs_reporting(self):
+        return sum(1 for s in self._batteries_dict.values() if self._dbusMon.dbusmon.get_value(s, "/Connected") == 1)
+
+    def _packs_ok(self):
+        """Spec "bad data": a pack unknown or gone, /Connected not 1, or None in a limit or /Soc."""
+        get = self._dbusMon.dbusmon.get_value
+        limits = ("/Info/MaxChargeCurrent", "/Info/MaxChargeVoltage", "/Info/MaxDischargeCurrent", "/Soc")
+        return (
+            self._batteries_ok
+            and self._packs_reporting() == len(self._batteries_dict)
+            and all(get(s, p) is not None for s in self._batteries_dict.values() for p in limits)
+        )
+
+    def _emergency_tick(self, packs_ok, real_soc=None):
+        """Feed the state machine, publish the emergency table when it gives limits. True: skip the normal publish
+        (emergency mode, or the 10 s grace that leaves the last good values on the bus)."""
+        voltages, current, min_socs = [], None, []
+        if self._emergency.active or not packs_ok:  # the inverter readings matter only here
+            voltages, current = self._read_inverters()
+            min_socs = self._read_min_socs()
+        self._stepped = True
+        limits = self._emergency.step(self._now(), packs_ok, voltages, current, min_socs, real_soc)
+        if limits is None:
+            return not packs_ok
+        cfg = self._emergency.cfg
+        valid = [v for v in voltages if v is not None and cfg.v_min <= v <= cfg.v_max]
+        voltage = min(valid) if valid else None
+        online = self._packs_reporting()
+        with self._dbusservice as bus:
+            bus["/Info/MaxChargeCurrent"] = limits.ccl
+            bus["/Io/AllowToCharge"] = limits.allow_charge
+            bus["/Info/MaxChargeVoltage"] = limits.cvl
+            bus["/Info/MaxDischargeCurrent"] = limits.dcl
+            bus["/Io/AllowToDischarge"] = limits.allow_discharge
+            bus["/Io/AllowToBalance"] = None
+            bus["/Soc"] = limits.soc
+            bus["/Dc/0/Voltage"] = voltage
+            bus["/Dc/0/Current"] = current
+            bus["/Dc/0/Power"] = voltage * current if voltage is not None and current is not None else None
+            bus["/Connected"] = 1
+            # unknown without pack data: never last-known or invented
+            for path in (
+                "/ConsumedAmphours",
+                "/TimeToGo",
+                "/Dc/0/Temperature",
+                "/System/MinCellTemperature",
+                "/System/MinTemperatureCellId",
+                "/System/MaxCellTemperature",
+                "/System/MaxTemperatureCellId",
+                "/System/MinCellVoltage",
+                "/System/MinVoltageCellId",
+                "/System/MaxCellVoltage",
+                "/System/MaxVoltageCellId",
+                "/System/NrOfModulesBlockingCharge",
+                "/System/NrOfModulesBlockingDischarge",
+            ):
+                bus[path] = None
+            for path in [p for p in self._dbusservice._dbusobjects if p.startswith("/Voltages/")]:  # sum, diff, cells
+                bus[path] = None  # never del_tree: that removes the paths, and the normal publish needs them back
+            bus["/System/NrOfModulesOnline"] = online
+            bus["/System/NrOfModulesOffline"] = settings.NR_OF_BATTERIES - online
+            for alarm in ("LowVoltage", "HighVoltage", "LowCellVoltage", "HighCellVoltage", "LowSoc", "HighChargeCurrent", "HighDischargeCurrent"):
+                bus["/Alarms/" + alarm] = 0
+            for alarm in ("CellImbalance", "InternalFailure", "HighChargeTemperature", "LowChargeTemperature", "HighTemperature", "LowTemperature"):
+                bus["/Alarms/" + alarm] = 0
+            bus["/Alarms/BmsCable"] = 2
+            bus["/EmergencyMode"] = 1
+            bus["/EmergencyReason"] = limits.reason
+        return True
+
+    def _update_normal(self):
 
         # DC
         Voltage = 0
@@ -1100,18 +1287,19 @@ class DbusAggBatService(object):
             file = exception_traceback.tb_frame.f_code.co_filename
             line = exception_traceback.tb_lineno
             locals_at_error = exception_traceback.tb_frame.f_locals
-            logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-            logging.error(f"Local variables at error: {locals_at_error}")
-            logging.error("Occured during step %s, Battery %s." % (step, i))
-            logging.error("Read trial nr. %d" % self._readTrials)
-            self._readTrials += 1
-            if self._readTrials > settings.READ_TRIALS:
-                logging.error("DBus read failed. Exiting...")
-                tt.sleep(settings.TIME_BEFORE_RESTART)
-                sys.exit(1)
+            self._read_failures += 1
+            if self._read_failures == 1:  # the dump once per run of failures: the log keeps ~100 KB
+                logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
+                logging.error(f"Local variables at error: {locals_at_error}")
+                logging.error("Occured during step %s, Battery %s." % (step, i))
             else:
-                # next call allowed
-                return True
+                logging.debug("Read failed again (%d in a row): %r during step %s", self._read_failures, exception_object, step)
+            self._emergency_tick(False)  # a read failure is bad pack data (was READ_TRIALS, then exit)
+            return True
+
+        if self._read_failures:
+            logging.info("Pack reads work again after %d failed ticks", self._read_failures)
+            self._read_failures = 0
 
         #####################################################
         # Process collected values (except of dictionaries) #
@@ -1227,13 +1415,8 @@ class DbusAggBatService(object):
                     success = False
                     pass
                 else:
-                    self._readTrials += 1
-                    if self._readTrials > settings.READ_TRIALS:
-                        tt.sleep(settings.TIME_BEFORE_RESTART)
-                        sys.exit(1)
-                    else:
-                        # next call allowed
-                        return True
+                    self._emergency_tick(False)  # bad data (was READ_TRIALS, then exit)
+                    return True
 
             if success:
                 # When a battery-mode SmartShunt is configured to be the
@@ -1258,9 +1441,6 @@ class DbusAggBatService(object):
             else:
                 # the BMS values are not overwritten
                 logging.error("Victron current reading error. Using BMS current and power instead")
-
-        # must be reset after try-except of all reads
-        self._readTrials = 1
 
         ####################################################################################################
         # Calculate own charge/discharge parameters (overwrite the values received from the SerialBattery) #
@@ -1441,6 +1621,10 @@ class DbusAggBatService(object):
                 # weighted sum
                 TimeToGo = TimeToGo / InstalledCapacity
 
+        # emergency mode (until 30 s of good data) publishes its own table instead
+        if self._emergency.active and self._emergency_tick(True, Soc):
+            return True
+
         #######################
         # Send values to DBus #
         #######################
@@ -1527,6 +1711,13 @@ class DbusAggBatService(object):
             bus["/Io/AllowToCharge"] = AllowToCharge
             bus["/Io/AllowToDischarge"] = AllowToDischarge
             bus["/Io/AllowToBalance"] = AllowToBalance
+            bus["/EmergencyMode"] = 0  # after the limits
+            bus["/EmergencyReason"] = ""
+
+        self._published = True
+        # a good tick counts only once its publish went through: a raising publish is bad data (stepped in _update)
+        if not self._stepped:
+            self._emergency_tick(True, Soc)
 
         # ##########################################################
         # ################ Periodic logging ########################
