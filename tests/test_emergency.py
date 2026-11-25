@@ -188,6 +188,25 @@ def test_exit_keeps_latch_until_30s_of_normal_mode():
     assert lim.dcl == 0 and lim.reason == "floor latched"
 
 
+def test_short_glitches_in_normal_mode_never_hold_the_latch():
+    e = make(Stored(latched=True))
+    enter(e)
+    t = 11
+    while e.active:
+        tick(e, t, True)
+        t += 1
+    for _ in range(2):  # 25 s good + 5 s bad: never enters, and must not restart the latch timer
+        for _ in range(25):
+            tick(e, t, True)
+            t += 1
+        for _ in range(5):
+            tick(e, t, False)
+            t += 1
+    assert not e.active and not e.latched
+    tick(e, t, True)
+    assert enter(e, t + 1).dcl == 140  # the next real loss can discharge again
+
+
 def test_persisted_latch_clears_in_normal_mode_after_exit_s():
     w = Rec()
     e = make(Stored(latched=True), w)

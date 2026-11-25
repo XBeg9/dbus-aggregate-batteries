@@ -65,6 +65,7 @@ class Emergency:
         self._latched = stored.latched
         self._bad_since: Optional[float] = None
         self._good_since: Optional[float] = None
+        self._normal_since: Optional[float] = None  # first successful normal publish since the last entry: times the latch
         self._below_since: Optional[float] = None
         self._cvl: Optional[float] = None
         self._saved_soc = None if stored.last_soc is None else round(stored.last_soc)
@@ -88,7 +89,7 @@ class Emergency:
     def _enter(self, startup: bool, bank_v: Optional[float]):
         self.active = True
         self._startup = startup
-        self._good_since = self._below_since = self._cvl = None
+        self._good_since = self._below_since = self._cvl = self._normal_since = None
         logging.warning("emergency mode ON (%s), bank %s V", "start-up without packs" if startup else "pack data lost", bank_v)
 
     def start_in_emergency(self, now: float) -> None:
@@ -114,7 +115,10 @@ class Emergency:
                 self._bad_since = None
                 if self._good_since is None:
                     self._good_since = now
-                if self._latched and now - self._good_since >= c.exit_s:  # a persisted latch ends with normal mode
+                if self._normal_since is None:
+                    self._normal_since = now
+                # the latch ends 30 s into normal mode: glitches too short to enter must not hold it on (only an entry resets it)
+                if self._latched and now - self._normal_since >= c.exit_s:
                     self._latched = False
                     self._persist()
                 if _soc_ok(real_soc):
@@ -136,7 +140,7 @@ class Emergency:
             if now - self._good_since >= c.exit_s:
                 logging.warning("emergency mode OFF, bank %s V", bank_v)
                 self.active = self._startup = False
-                # the latch stays until 30 s of successful normal publishes (the branch above): a failing publish re-enters latched
+                # the latch stays until 30 s of normal mode (the branch above): a failing first publish re-enters latched
                 self._bad_since = self._good_since = self._below_since = self._cvl = None
                 return None
         else:

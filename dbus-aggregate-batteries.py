@@ -127,6 +127,8 @@ class DbusAggBatService(object):
         self._searched_at = 0.0
         self._read_failures = 0  # normal-path read failures in a row: the locals dump goes to the log once per run
         self._update_failures = 0  # ticks in a row that raised: the traceback goes to the log once per run
+        self._update_error = None  # the exception type of that run: a different one is logged again
+        self._published = False  # this tick's normal publish went through
         self._ve_paths = {}  # inverter/ESS service -> paths read in emergency mode
         self._dbusConn = get_bus()
         logging.info("Initializing VeDbusService...")
@@ -836,20 +838,23 @@ class DbusAggBatService(object):
     def _update(self):
         """GLib timer: must never raise or return False, so the aggregate keeps updating (spec 2026-11-24)."""
         self._stepped = False  # the state machine steps once per tick
+        self._published = False
         try:
             self._relist()
             if not self._packs_ok():
                 self._emergency_tick(False)
             else:
                 self._update_normal()
-            # only a normal publish ends a run: emergency ticks in between would log the traceback again every ~40 s
-            if self._update_failures and not self._emergency.active:
+            # only a normal publish ends a run: emergency or grace ticks in between would log the traceback again every ~40 s
+            if self._update_failures and self._published:
                 logging.info("Update works again after %d failed ticks", self._update_failures)
                 self._update_failures = 0
+                self._update_error = None
             return True
-        except Exception:
+        except Exception as ex:
             self._update_failures += 1
-            if self._update_failures == 1:  # once per run of failures: the log keeps ~100 KB
+            if self._update_failures == 1 or type(ex) is not self._update_error:  # once per run and kind: the log keeps ~100 KB
+                self._update_error = type(ex)
                 logging.exception("Update failed, counts as bad pack data")
             else:
                 logging.debug("Update failed again (%d in a row)", self._update_failures, exc_info=True)
@@ -1709,6 +1714,7 @@ class DbusAggBatService(object):
             bus["/EmergencyMode"] = 0  # after the limits
             bus["/EmergencyReason"] = ""
 
+        self._published = True
         # a good tick counts only once its publish went through: a raising publish is bad data (stepped in _update)
         if not self._stepped:
             self._emergency_tick(True, Soc)

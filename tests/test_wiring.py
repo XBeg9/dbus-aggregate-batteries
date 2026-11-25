@@ -343,6 +343,35 @@ def test_publish_exception_traceback_logged_once_per_run(world, caplog):
     assert caplog.text.count("Update works again after") == 1
 
 
+def test_failure_run_ends_only_with_a_normal_publish_and_a_new_kind_is_logged(world, caplog):
+    svc = started(world)
+    tick(world, svc)
+    svc._dbusservice.fail = "/System/NrOfCellsPerBattery"
+    with caplog.at_level(logging.INFO):
+        tick(world, svc, 3)
+        for p in PACKS:
+            world.bus[p]["/Connected"] = 0
+        tick(world, svc, 3)  # grace ticks publish nothing: they must not end the run
+        for p in PACKS:
+            world.bus[p]["/Connected"] = 1
+        tick(world, svc, 3)
+        assert "Update works again" not in caplog.text
+        assert len([r for r in caplog.records if r.exc_info and r.levelno >= logging.ERROR]) == 1
+        normal = svc._update_normal
+
+        def other():
+            raise ValueError("another fault")
+
+        svc._update_normal = other
+        tick(world, svc)
+        svc._update_normal = normal
+        svc._dbusservice.fail = None
+        tick(world, svc, 40)
+    tracebacks = [r for r in caplog.records if r.exc_info and r.levelno >= logging.ERROR]
+    assert [r.exc_info[0] for r in tracebacks] == [RuntimeError, ValueError]
+    assert caplog.text.count("Update works again after") == 1
+
+
 def test_normal_values_return_after_emergency(world, caplog):
     svc = started(world)
     tick(world, svc)
