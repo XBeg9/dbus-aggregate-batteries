@@ -136,10 +136,8 @@ class Emergency:
             if now - self._good_since >= c.exit_s:
                 logging.warning("emergency mode OFF, bank %s V", bank_v)
                 self.active = self._startup = False
+                # the latch stays until 30 s of successful normal publishes (the branch above): a failing publish re-enters latched
                 self._bad_since = self._good_since = self._below_since = self._cvl = None
-                if self._latched:
-                    self._latched = False
-                    self._persist()
                 return None
         else:
             self._good_since = None
@@ -165,9 +163,9 @@ class Emergency:
         known = [s for s in min_socs if s is not None]
         last = self.stored.last_soc
         if known and last is not None:
-            soc = min(last, min(known) - 1)
+            soc = max(0.0, min(last, min(known) - 1))
         elif known:
-            soc = min(known) - 1
+            soc = max(0.0, min(known) - 1)
         else:
             soc = last
 

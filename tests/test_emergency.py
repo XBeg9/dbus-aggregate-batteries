@@ -131,6 +131,8 @@ def test_soc_rule():
     assert soc((None, None), 83) == 83
     assert soc((100, 100), None) == 99
     assert soc((None, None), None) is None
+    assert soc((0, 95), 40) == 0  # an ESS minimum of 0 never gives -1
+    assert soc((0, None), None) == 0
 
 
 def test_last_soc_only_updates_in_normal_mode():
@@ -173,6 +175,17 @@ def test_write_failure_is_ignored():
         tick(e, t, False, v=(50.2,), i=-10.0)
     lim = tick(e, 130, False, v=(50.2,), i=-10.0)
     assert len(calls) > n and lim.dcl == 0
+
+
+def test_exit_keeps_latch_until_30s_of_normal_mode():
+    w = Rec()
+    e = make(Stored(latched=True), w)
+    enter(e)
+    for t in range(100, 131):
+        tick(e, t, True)
+    assert not e.active and e.latched  # a failing first normal publish must re-enter latched
+    lim = enter(e, 200)
+    assert lim.dcl == 0 and lim.reason == "floor latched"
 
 
 def test_persisted_latch_clears_in_normal_mode_after_exit_s():

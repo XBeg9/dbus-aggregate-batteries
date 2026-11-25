@@ -3,6 +3,7 @@
 import ast
 import importlib.util
 import json
+import logging
 import shutil
 import sys
 import types
@@ -329,6 +330,19 @@ def test_persistent_publish_exception_enters_emergency(world):
     assert svc._dbusservice["/Info/MaxChargeCurrent"] == 0
 
 
+def test_publish_exception_traceback_logged_once_per_run(world, caplog):
+    svc = started(world)
+    tick(world, svc)
+    svc._dbusservice.fail = "/System/NrOfCellsPerBattery"
+    with caplog.at_level(logging.INFO):
+        tick(world, svc, 150)  # in and out of emergency mode while the publish keeps raising
+        svc._dbusservice.fail = None
+        tick(world, svc, 40)
+    tracebacks = [r for r in caplog.records if r.levelno >= logging.ERROR and r.exc_info]
+    assert len(tracebacks) == 1
+    assert caplog.text.count("Update works again after") == 1
+
+
 def test_normal_values_return_after_emergency(world, caplog):
     svc = started(world)
     tick(world, svc)
@@ -453,3 +467,19 @@ def test_missing_current_means_no_load_correction(world):
     tick(world, svc, 30)
     assert b["/Info/MaxDischargeCurrent"] == 0  # no correction: 50.3 V is below the floor
     assert b["/EmergencyReason"] == "floor latched"
+
+
+def test_latch_survives_while_normal_publish_keeps_failing(world, tmp_path):
+    (tmp_path / "storedvalue_emergency").write_text(json.dumps({"latched": True, "last_soc": 40.0}))
+    svc = started(world)
+    for v in (VEBUS, MULTI):
+        world.bus[v].update({"/Dc/0/Voltage": 49.5, "/Dc/0/Current": 0.0})  # below the 50.4 V floor
+    svc._dbusservice.fail = "/System/NrOfCellsPerBattery"  # only the normal publish writes it: it raises every tick
+    b = svc._dbusservice
+    opened = []
+    for _ in range(150):
+        tick(world, svc)
+        if b["/Info/MaxDischargeCurrent"] > 0:
+            opened.append((world.t, b["/EmergencyMode"]))
+    assert not opened, "discharge reopened with no successful normal publish: %s" % opened[:3]
+    assert json.loads((tmp_path / "storedvalue_emergency").read_text())["latched"] is True

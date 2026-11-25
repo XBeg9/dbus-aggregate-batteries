@@ -126,6 +126,7 @@ class DbusAggBatService(object):
         self._searched_packs = None  # the pack services at the last search from _relist
         self._searched_at = 0.0
         self._read_failures = 0  # normal-path read failures in a row: the locals dump goes to the log once per run
+        self._update_failures = 0  # ticks in a row that raised: the traceback goes to the log once per run
         self._ve_paths = {}  # inverter/ESS service -> paths read in emergency mode
         self._dbusConn = get_bus()
         logging.info("Initializing VeDbusService...")
@@ -839,10 +840,19 @@ class DbusAggBatService(object):
             self._relist()
             if not self._packs_ok():
                 self._emergency_tick(False)
-                return True
-            return self._update_normal()
+            else:
+                self._update_normal()
+            # only a normal publish ends a run: emergency ticks in between would log the traceback again every ~40 s
+            if self._update_failures and not self._emergency.active:
+                logging.info("Update works again after %d failed ticks", self._update_failures)
+                self._update_failures = 0
+            return True
         except Exception:
-            logging.exception("Update failed, counts as bad pack data")
+            self._update_failures += 1
+            if self._update_failures == 1:  # once per run of failures: the log keeps ~100 KB
+                logging.exception("Update failed, counts as bad pack data")
+            else:
+                logging.debug("Update failed again (%d in a row)", self._update_failures, exc_info=True)
             if self._emergency.active:
                 try:
                     self._dbusservice["/Info/MaxChargeCurrent"] = 0
